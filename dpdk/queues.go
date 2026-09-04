@@ -249,7 +249,14 @@ func (q *TxQueue) SendFunc(count int, build func(i int, frame []byte) int) (int,
 
 	descs := t.Alloc(count)
 	if len(descs) == 0 {
-		return 0, nil
+		// This queue's own bookkeeping (NumFreeSlots) says there is no room.
+		// For a driver that never reclaims completions except inside a live
+		// transmit -- virtio-net, confirmed; see TransmitForce -- that count
+		// can pin at zero forever once nothing calls TxBurst again, even
+		// though the driver's real ring may have had room the whole time.
+		// Force exactly one real send through and let the driver's own answer
+		// settle it, rather than deadlock silently.
+		return q.sendProbe(t, build)
 	}
 	r := &region{d: q.dev}
 	built := 0
@@ -274,6 +281,38 @@ func (q *TxQueue) SendFunc(count int, build func(i int, frame []byte) int) (int,
 	sent := t.Transmit(descs[:built])
 	if sent < built {
 		t.Free(descs[sent:built])
+	}
+	return sent, nil
+}
+
+// sendProbe is SendFunc's fallback for a ring this queue's own bookkeeping
+// believes is full: see queue.Tx.TransmitForce for why this exists and why it
+// is safe to call whenever normal reclaim came back empty. It costs one frame
+// from the pool for one real transmit attempt; if the driver declines it the
+// frame is freed back exactly as an ordinary short Transmit would leave it.
+func (q *TxQueue) sendProbe(t *queue.Tx, build func(i int, frame []byte) int) (int, error) {
+	descs := t.AllocForce(1)
+	if len(descs) == 0 {
+		// The frame pool itself is empty, not just this queue's ring-depth
+		// count -- nothing to probe with.
+		return 0, nil
+	}
+	r := &region{d: q.dev}
+	frame := r.Writable(descs[0])
+	n := build(0, frame)
+	if n == 0 {
+		t.Free(descs)
+		return 0, nil
+	}
+	if n < 0 || n > len(frame) {
+		t.Free(descs)
+		return 0, fmt.Errorf("%w: %d bytes into a %d-byte frame",
+			packetio.ErrBadLength, n, len(frame))
+	}
+	descs[0].Len = uint32(n)
+	sent := t.TransmitForce(descs)
+	if sent == 0 {
+		t.Free(descs)
 	}
 	return sent, nil
 }

@@ -38,6 +38,12 @@ type fakePMD struct {
 	holding    []uint64
 	sent       int
 
+	// pokeBroken models a driver whose Poke does not reclaim anything at all --
+	// virtio-net, observed: it implements neither rte_eth_tx_done_cleanup nor a
+	// tx_descriptor_status with a side effect, so completions are only ever
+	// read inside a live, non-empty TxBurst.
+	pokeBroken bool
+
 	// receive
 	rxOlFlags uint64
 	// chained makes every delivered packet claim more than one mbuf.
@@ -68,7 +74,12 @@ func (f *fakePMD) TxBurst(mbufs []uint64) int {
 	return n
 }
 
-func (f *fakePMD) Poke() { f.completions() }
+func (f *fakePMD) Poke() {
+	if f.pokeBroken {
+		return
+	}
+	f.completions()
+}
 
 // completions hands back everything the driver holds, but only once enough has
 // accumulated. Below the threshold it does nothing at all, which is the trap.
