@@ -391,7 +391,19 @@ int pio_configure(uint16_t port, uint16_t nrx, uint16_t ntx, uint32_t mtu,
 	conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
 	conf.txmode.mq_mode = RTE_ETH_MQ_TX_NONE;
 	conf.rxmode.mtu = mtu;
-	if (nrx > 1) {
+	/* RSS mode is how a NIC picks which of several receive queues a packet
+	 * lands in; a PMD with no RSS capability at all (virtio-net: it has
+	 * queue pairs, but no hash-based selection of its own -- whatever picks
+	 * a queue, if anything does, is the backend behind it) reports
+	 * flow_type_rss_offloads == 0. Asking rte_eth_dev_configure for
+	 * RTE_ETH_MQ_RX_RSS on such a device is refused outright with -ENOTSUP,
+	 * even though the device is otherwise perfectly willing to open several
+	 * queues -- confirmed against a virtio-net device behind a vhost-user
+	 * backend that dpdk-testpmd configures for 8 queues without complaint,
+	 * because testpmd does not force RSS mode on a device that cannot do it
+	 * either. Only ask for it when the device actually offers something to
+	 * hash on. */
+	if (nrx > 1 && info.flow_type_rss_offloads != 0) {
 		conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
 		conf.rx_adv_conf.rss_conf.rss_hf =
 			(RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP | RTE_ETH_RSS_TCP) &
