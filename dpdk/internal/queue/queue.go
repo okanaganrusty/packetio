@@ -295,16 +295,26 @@ func NewTx(cfg Config) (*Tx, error) {
 //
 // It never returns more than the following Transmit could accept, so a caller
 // that transmits everything it allocated cannot leak a frame.
-func (t *Tx) Alloc(n int) []packetio.Desc {
+func (t *Tx) Alloc(n int) []packetio.Desc { return t.alloc(n, false) }
+
+// AllocForce is Alloc without the ring-depth check: it draws only against the
+// frame pool, ignoring how many frames this queue's own bookkeeping believes
+// are outstanding with the driver. See TransmitForce for why this exists;
+// always pair an AllocForce with a TransmitForce, never a plain Transmit.
+func (t *Tx) AllocForce(n int) []packetio.Desc { return t.alloc(n, true) }
+
+func (t *Tx) alloc(n int, force bool) []packetio.Desc {
 	if t.closed.Load() || n <= 0 || t.dead.Load() != nil {
 		return nil
 	}
-	if free := t.NumFreeSlots(); n > free {
-		if free == 0 {
-			t.Stats.RingFull.Add(1)
-			return nil
+	if !force {
+		if free := t.NumFreeSlots(); n > free {
+			if free == 0 {
+				t.Stats.RingFull.Add(1)
+				return nil
+			}
+			n = free
 		}
-		n = free
 	}
 	if have := t.pool.Len(); n > have {
 		if have == 0 {
@@ -335,7 +345,31 @@ func (t *Tx) Alloc(n int) []packetio.Desc {
 // wrote: that is the behaviour of every other backend, and refusing it would
 // make an ARP frame an error.
 func (t *Tx) Transmit(descs []packetio.Desc) int {
-	n, _ := t.transmit(descs, nil)
+	n, _ := t.transmit(descs, nil, false)
+	return n
+}
+
+// TransmitForce is Transmit without the ring-depth check: it asks the driver
+// directly instead of trusting this queue's own count of what the driver
+// still owns.
+//
+// It exists for a driver that implements neither rte_eth_tx_done_cleanup nor
+// a tx_descriptor_status that reclaims completions as a side effect -- observed
+// on virtio-net, where transmit completions are only ever freed inside a live
+// TxBurst carrying at least one real packet (see PMD.Poke). Once such a
+// queue's own bookkeeping (NumFreeSlots) reaches zero, plain Alloc/Transmit
+// can never call TxBurst again to find out otherwise: nothing is left to
+// unstick it, even though the driver's real ring may have had room the whole
+// time, or gets it back moments later. TransmitForce paired with AllocForce is
+// the escape hatch -- it costs one frame from the pool and asks the driver
+// directly: if it genuinely has no room the frame comes back exactly as a
+// normal short Transmit would leave it, and if it takes the frame, that call
+// is what runs the driver's own completion handling, so Returned starts
+// filling again and ordinary accounting recovers from there. Safe to call
+// whenever normal reclaim is idle; a driver whose Poke already works simply
+// never needs it, since NumFreeSlots never pins at zero to begin with.
+func (t *Tx) TransmitForce(descs []packetio.Desc) int {
+	n, _ := t.transmit(descs, nil, true)
 	return n
 }
 
@@ -352,7 +386,7 @@ func (t *Tx) TransmitOffload(descs []packetio.Desc, offs []packetio.Offload) (in
 		return 0, fmt.Errorf("%w: %d descriptors but %d offloads",
 			packetio.ErrBadLength, len(descs), len(offs))
 	}
-	return t.transmit(descs, offs)
+	return t.transmit(descs, offs, false)
 }
 
 // applyOffload writes what one packetio.Offload means for this mbuf, or reports
@@ -423,7 +457,7 @@ func (t *Tx) applyOffload(m int, o packetio.Offload, packet []byte) error {
 	return nil
 }
 
-func (t *Tx) transmit(descs []packetio.Desc, offs []packetio.Offload) (int, error) {
+func (t *Tx) transmit(descs []packetio.Desc, offs []packetio.Offload, force bool) (int, error) {
 	if t.closed.Load() {
 		return 0, packetio.ErrClosed
 	}
@@ -437,12 +471,14 @@ func (t *Tx) transmit(descs []packetio.Desc, offs []packetio.Offload) (int, erro
 		return 0, nil
 	}
 	n := len(descs)
-	if free := t.NumFreeSlots(); n > free {
-		n = free
-	}
-	if n == 0 {
-		t.Stats.RingFull.Add(1)
-		return 0, nil
+	if !force {
+		if free := t.NumFreeSlots(); n > free {
+			n = free
+		}
+		if n == 0 {
+			t.Stats.RingFull.Add(1)
+			return 0, nil
+		}
 	}
 	if n > len(t.mbufs) {
 		n = len(t.mbufs)
